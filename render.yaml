@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: kings-corner
+    runtime: static
+    buildCommand: ""
+    staticPublishPath: .
