@@ -218,7 +218,6 @@ input:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
 .banner span { min-width: 0; }
 .seat.away { opacity: .7; }
 </style>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 
 </head>
 <body>
@@ -719,8 +718,47 @@ input:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
 
   // ---------------- online (direct device-to-device) ----------------
   const netErr = t => { $('netErr').textContent = t || ''; };
-  const peerOpts = () => Object.assign({ debug: 0 }, window.KC_PEER_OPTS || {});
-  const NET_FAIL = "Couldn't connect to the online service. Check your internet connection and try again.";
+  const ICE = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+  ];
+  const peerOpts = () => Object.assign({ debug: 0, config: { iceServers: ICE } }, window.KC_PEER_OPTS || {});
+  const NET_FAIL = "Couldn't reach the online game service. Check your internet connection and try again.";
+  const LIB_FAIL = "Couldn't load online play. Check your internet connection, then reload the page.";
+  const PEER_SRC = [
+    'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js',
+    'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js',
+  ];
+  let peerLoad = null;
+  // Load the connection library, trying backup sources if one is blocked or down.
+  function loadPeer() {
+    if (typeof window.Peer === 'function') return Promise.resolve(true);
+    if (peerLoad) return peerLoad;
+    peerLoad = new Promise(resolve => {
+      let i = 0;
+      const next = () => {
+        if (typeof window.Peer === 'function') return resolve(true);
+        if (i >= PEER_SRC.length) { peerLoad = null; return resolve(false); }
+        const tag = document.createElement('script');
+        tag.src = PEER_SRC[i++];
+        tag.async = true;
+        const timer = setTimeout(() => { tag.onload = tag.onerror = null; next(); }, 8000);
+        tag.onload = () => { clearTimeout(timer); next(); };
+        tag.onerror = () => { clearTimeout(timer); tag.remove(); next(); };
+        document.head.appendChild(tag);
+      };
+      next();
+    });
+    return peerLoad;
+  }
+  function peerErrText(e, code) {
+    const t = e && e.type;
+    if (t === 'browser-incompatible') return "This browser can't do online play. Try Chrome, Safari, Edge, or Firefox.";
+    if (t === 'peer-unavailable') return `No game found with code ${code}. Check the code, and make sure the host still has the page open.`;
+    if (t === 'network' || t === 'server-error' || t === 'socket-error' || t === 'socket-closed') return NET_FAIL;
+    return `${NET_FAIL} (${t || 'unknown error'})`;
+  }
   function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; let s = ''; for (let i = 0; i < 4; i++) s += A[Math.floor(Math.random() * A.length)]; return s; }
   function myName() {
     const name = cleanName($('netName').value);
@@ -729,10 +767,11 @@ input:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
   }
   function failToMenu(msg) { goMenu(); netErr(msg); }
 
-  function hostGame() {
+  async function hostGame() {
     const name = myName();
     if (!name) { netErr('Type your name first so friends know who you are.'); $('netName').focus(); return; }
-    if (typeof window.Peer !== 'function') { netErr(NET_FAIL); return; }
+    netErr('Getting online play ready…');
+    if (!(await loadPeer())) { netErr(LIB_FAIL); return; }
     stopAll(); netErr('');
     M.mode = 'net';
     const n = { role: 'host', state: 'connecting', code: '', peer: null, conns: new Map(), seats: [{ pid: myPid, name }] };
@@ -746,11 +785,12 @@ input:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
       peer.on('disconnected', () => { if (M.net === n && !peer.destroyed) setTimeout(() => { try { peer.reconnect(); } catch (e) {} }, 1500); });
       peer.on('error', e => {
         if (M.net !== n) return;
-        if (e.type === 'unavailable-id' && attempt < 5 && n.state === 'connecting') { try { peer.destroy(); } catch (x) {} open(attempt + 1); }
-        else if (n.state === 'connecting') failToMenu(NET_FAIL);
+        const retry = e.type === 'unavailable-id' ? attempt < 5 : (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error') && attempt < 1;
+        if (retry && n.state === 'connecting') { try { peer.destroy(); } catch (x) {} setTimeout(() => { if (M.net === n) open(attempt + 1); }, 800); }
+        else if (n.state === 'connecting') failToMenu(peerErrText(e));
       });
     };
-    n.timer = setTimeout(() => { if (M.net === n && n.state === 'connecting') failToMenu(NET_FAIL); }, 15000);
+    n.timer = setTimeout(() => { if (M.net === n && n.state === 'connecting') failToMenu(NET_FAIL); }, 20000);
     open(0);
     render();
   }
@@ -818,24 +858,30 @@ input:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
     commit();
   }
 
-  function joinGame() {
+  async function joinGame() {
     const code = ($('joinCode').value || '').trim().toUpperCase();
     const name = myName();
     if (!name) { netErr('Type your name first so friends know who you are.'); $('netName').focus(); return; }
     if (!/^[A-Z]{4}$/.test(code)) { netErr('Enter the 4-letter code from your friend.'); $('joinCode').focus(); return; }
-    if (typeof window.Peer !== 'function') { netErr(NET_FAIL); return; }
+    netErr('Getting online play ready…');
+    if (!(await loadPeer())) { netErr(LIB_FAIL); return; }
     stopAll(); netErr('');
     M.mode = 'net';
     const n = { role: 'guest', state: 'connecting', code, name, peer: new Peer(undefined, peerOpts()), conn: null, seats: [] };
     M.net = n;
-    n.peer.on('open', () => connectHost(n));
+    n.peer.on('open', () => { n.peerOpen = true; connectHost(n); });
     n.peer.on('disconnected', () => { if (M.net === n && !n.peer.destroyed) setTimeout(() => { try { n.peer.reconnect(); } catch (e) {} }, 1500); });
     n.peer.on('error', e => {
       if (M.net !== n) return;
-      if (n.state === 'connecting') failToMenu(e.type === 'peer-unavailable' ? `No game found with code ${code}. Check the code with your host.` : NET_FAIL);
+      if (n.state === 'connecting') failToMenu(peerErrText(e, code));
       else if (e.type === 'peer-unavailable') { n.state = 'lost'; render(); }
     });
-    n.timer = setTimeout(() => { if (M.net === n && n.state === 'connecting') failToMenu(`Couldn't reach the game ${code}. Check the code and that the host still has the page open.`); }, 15000);
+    n.timer = setTimeout(() => {
+      if (M.net !== n || n.state !== 'connecting') return;
+      failToMenu(n.peerOpen
+        ? `Found game ${code} but couldn't connect to the host's device. Try again. If it keeps failing, have everyone switch to mobile data or the same Wi-Fi.`
+        : NET_FAIL);
+    }, 20000);
     render();
   }
   function connectHost(n) {
@@ -916,6 +962,7 @@ input:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
   });
 
   render();
+  loadPeer();
 })();
 </script>
 
